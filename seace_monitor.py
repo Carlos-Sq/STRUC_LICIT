@@ -146,7 +146,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # --- Correo (SMTP) ---
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT") or "587"))
+SMTP_PORT = int(os.getenv("SMTP_PORT") or "587")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")  # usar "Contraseña de aplicación" de Gmail
 EMAIL_TO = os.getenv("EMAIL_TO", "")
