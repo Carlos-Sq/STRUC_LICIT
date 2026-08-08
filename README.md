@@ -1,0 +1,1 @@
+# STRUC_LICIT
