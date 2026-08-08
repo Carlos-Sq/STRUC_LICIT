@@ -138,7 +138,7 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 SEEN_FILE = DATA_DIR / "seen_items.json"
 
-INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "30"))
+INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES") or "30")
 
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
