@@ -1,0 +1,55 @@
+name: SEACE Monitor - Revisión diaria
+
+on:
+  schedule:
+    # Corre todos los días a las 08:05 hora Perú (13:05 UTC, Perú = UTC-5)
+    - cron: "5 13 * * *"
+  workflow_dispatch: {}   # también te deja correrlo manualmente desde la pestaña "Actions"
+
+# Evita que corran dos revisiones al mismo tiempo si una se atrasa
+concurrency:
+  group: seace-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Google Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar el monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python seace_monitor.py
+
+      # El runner de GitHub se borra por completo después de cada ejecución,
+      # así que "seen_items.json" (el registro de lo ya avisado) se guardaría
+      # en la nube sólo si lo devolvemos al repositorio. Este paso lo commitea
+      # de vuelta automáticamente para que la próxima corrida sepa qué ya viste.
+      - name: Guardar registro de licitaciones ya notificadas
+        run: |
+          git config user.name "seace-monitor-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/seen_items.json
+          git diff --staged --quiet || git commit -m "Actualiza registro de licitaciones vistas [skip ci]"
+          git push
