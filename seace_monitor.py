@@ -601,13 +601,19 @@ def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram no configurado (falta TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en .env)")
         return
+
+    # TELEGRAM_CHAT_ID puede tener uno o varios chat_id separados por coma,
+    # ej: "111111111,222222222" para avisarle a más de una persona.
+    chat_ids = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()]
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
-        if resp.status_code != 200:
-            log.error("Error enviando Telegram: %s %s", resp.status_code, resp.text)
-    except Exception as e:
-        log.error("Excepción enviando Telegram: %s", e)
+    for chat_id in chat_ids:
+        try:
+            resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=15)
+            if resp.status_code != 200:
+                log.error("Error enviando Telegram a %s: %s %s", chat_id, resp.status_code, resp.text)
+        except Exception as e:
+            log.error("Excepción enviando Telegram a %s: %s", chat_id, e)
 
 
 def send_email(subject: str, body: str) -> None:
