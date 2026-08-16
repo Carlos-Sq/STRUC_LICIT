@@ -6,10 +6,15 @@ Qué hace:
   1. Abre el Buscador de Contrataciones Menores del SEACE
      (https://prod6.seace.gob.pe/buscador-publico/contrataciones)
   2. Busca, una por una, las palabras clave definidas en KEYWORDS
-     (mochila, buzo, polo, textil, uniforme, etc.)
+     (mochila, morral, maletín, bolsa de tela)
   3. Extrae los resultados de cada búsqueda (entidad, descripción, monto, fecha, link)
-  4. Compara contra un registro local (seen_items.json) para saber cuáles son NUEVOS
-  5. Si hay resultados nuevos, te avisa por Telegram y por Correo
+  4. Descarga el PDF de "Descargar requerimiento" de cada resultado nuevo y
+     revisa si el texto realmente contiene alguna de las palabras clave
+     (esto evita avisos de licitaciones que solo mencionan la palabra de
+     pasada en el título pero no son realmente del producto buscado, o que
+     el buscador del sitio trajo por error).
+  5. Compara contra un registro local (seen_items.json) para saber cuáles son NUEVOS
+  6. Si hay resultados nuevos y verificados, te avisa por Telegram y por Correo
 
 Cómo se ejecuta:
   - Una sola vez:      python seace_monitor.py
@@ -28,9 +33,15 @@ IMPORTANTE — LEE ESTO ANTES DE USARLO:
   "Inspeccionar", y copiar el atributo id/class/name real que veas ahí, porque
   el sitio del Estado puede cambiar sin aviso. Te dejé instrucciones detalladas
   en el README para hacer esto paso a paso, no toma más de 5 minutos.
+
+  NOTA sobre la verificación por PDF: el enlace "Descargar requerimiento" y su
+  atributo href se leen de cada tarjeta de resultado. Si el sitio cambia el
+  texto de ese botón o requiere sesión/login para descargar el PDF, revisa la
+  función find_requerimiento_link() y verificar_requerimiento_pdf() más abajo.
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -38,6 +49,7 @@ import re
 import smtplib
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -45,6 +57,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from pypdf import PdfReader
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -61,77 +74,18 @@ load_dotenv()  # carga variables desde el archivo .env
 
 SEACE_URL = "https://prod6.seace.gob.pe/buscador-publico/contrataciones"
 
-# Palabras clave relacionadas a textil / mochilas. Agrega o quita las que quieras.
+# Palabras clave. Se dejaron solo las que pediste, con singular/plural para
+# no perder resultados por una diferencia de género/número en el título.
 KEYWORDS = [
-    "mochila",
-    "mochilas",
-    "buzo",
-    "buzos",
-    "polo",
-    "polos",
-    "textil",
-    "textiles",
-    "uniforme",
-    "uniformes",
-    "confeccion",
-    "confección",
-    "indumentaria",
-    "chaleco",
-    "chalecos",
-    "casaca",
-    "casacas",
-    "prendas",
-    # --- agregadas: línea de productos DEHSE (bolsos, canguros, carteras) ---
-    "bolso",
-    "bolsos",
-    "canguro",
-    "canguros",
-    "cartera",
-    "carteras",
+    "bolsa de tela",
+    "bolsas de tela",
     "morral",
     "morrales",
     "maletin",
     "maletín",
     "maletines",
-    "mandil",
-    "mandiles",
-    "delantal",
-    "delantales",
-    # --- agregadas: catálogo completo de categorías de producto ---
-    "riñonera",
-    "riñoneras",
-    "portafolio",
-    "portafolios",
-    "cartuchera",
-    "cartucheras",
-    "estuche",
-    "estuches",
-    "funda",
-    "fundas",
-    "neceser",
-    "neceseres",
-    "bolsa",
-    "bolsas",
-    "organizador",
-    "organizadores",
-    "chaqueta",
-    "chaquetas",
-    "cortavientos",
-    "polera",
-    "poleras",
-    "pantalon",
-    "pantalón",
-    "pantalones",
-    "short",
-    "shorts",
-    "overol",
-    "overoles",
-    "ropa deportiva",
-    "ropa industrial",
-    "productos para mascotas",
-    "productos para hogar",
-    "productos promocionales",
-    "accesorios textiles",
+    "mochila",
+    "mochilas",
 ]
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -194,6 +148,22 @@ def _cotizacion_sigue_vigente(cotizaciones_texto: str) -> bool:
     return fecha_fin >= ahora
 
 
+def _normalizar(texto: str) -> str:
+    """Minúsculas y sin tildes, para comparar 'maletín' == 'maletin'."""
+    texto = texto.lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in texto if not unicodedata.combining(c))
+
+
+def pdf_contiene_palabra_clave(texto_pdf: str) -> str | None:
+    """Devuelve la primera palabra clave encontrada en el texto del PDF, o None."""
+    texto_norm = _normalizar(texto_pdf)
+    for kw in KEYWORDS:
+        if _normalizar(kw) in texto_norm:
+            return kw
+    return None
+
+
 @dataclass
 class Contratacion:
     id: str
@@ -237,6 +207,29 @@ def build_driver(headless: bool = True) -> webdriver.Chrome:
     )
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=options)
+
+
+def build_http_session_from_driver(driver: webdriver.Chrome) -> requests.Session:
+    """
+    Crea una sesión de 'requests' que copia las cookies del navegador de
+    Selenium, para poder descargar los PDF de requerimiento (por si el sitio
+    exige alguna cookie de sesión para servir el archivo).
+    """
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            )
+        }
+    )
+    try:
+        for cookie in driver.get_cookies():
+            session.cookies.set(cookie.get("name"), cookie.get("value"))
+    except Exception as e:
+        log.warning("No se pudieron copiar las cookies del navegador a la sesión HTTP: %s", e)
+    return session
 
 
 def _find_filter_checkbox(driver, formgroupname_candidates: list[str], option_text: str):
@@ -293,10 +286,9 @@ def _is_mat_checkbox_checked(mat_checkbox_el) -> bool:
 
 def ensure_filters(driver: webdriver.Chrome) -> None:
     """
-    Verifica que los filtros "Objeto: Bien", "Objeto: Servicio" y
-    "Estado: Vigente" estén marcados antes de cada búsqueda (requisito
-    indicado por el usuario). Si por algún motivo no lo están, hace clic
-    para marcarlos.
+    Verifica que los filtros "Objeto: Bien" y "Estado: Vigente" estén
+    marcados antes de cada búsqueda (requisito indicado por el usuario).
+    Si por algún motivo no lo están, hace clic para marcarlos.
 
     Confirmado en el sitio: la sección "Objeto" vive en <div formgroupname="objetos">.
     Para "Estado" se prueban varios nombres posibles de formgroup por si el
@@ -304,7 +296,6 @@ def ensure_filters(driver: webdriver.Chrome) -> None:
     """
     filtros = [
         (["objetos", "objeto"], "Bien"),
-        (["objetos", "objeto"], "Servicio"),
         (["estados", "estado"], "Vigente"),
     ]
     for formgroups, opcion in filtros:
@@ -327,11 +318,72 @@ def ensure_filters(driver: webdriver.Chrome) -> None:
             )
 
 
-def search_keyword(driver: webdriver.Chrome, keyword: str) -> list[Contratacion]:
+def find_requerimiento_link(tarjeta) -> str | None:
+    """
+    Busca dentro de la tarjeta el enlace/botón "Descargar requerimiento" y
+    devuelve su href (la URL del PDF). Si no lo encuentra, devuelve None.
+
+    # AJUSTAR: si el sitio cambia el texto del botón (ej. "Descargar bases",
+    # "Ver requerimiento", etc.) o lo convierte en un <button> con JS en vez
+    # de un <a href>, hay que actualizar este selector.
+    """
+    try:
+        a_tag = tarjeta.find_element(By.XPATH, ".//a[contains(., 'Descargar requerimiento')]")
+        href = a_tag.get_attribute("href")
+        if href:
+            return href
+    except Exception:
+        pass
+    return None
+
+
+def extraer_texto_pdf(pdf_bytes: bytes) -> str:
+    """Extrae el texto de un PDF (bytes) usando pypdf."""
+    lector = PdfReader(io.BytesIO(pdf_bytes))
+    paginas_texto = []
+    for pagina in lector.pages:
+        try:
+            paginas_texto.append(pagina.extract_text() or "")
+        except Exception:
+            continue
+    return "\n".join(paginas_texto)
+
+
+def verificar_requerimiento_pdf(session: requests.Session, url_pdf: str) -> tuple[bool, str]:
+    """
+    Descarga el PDF del requerimiento y revisa si contiene alguna de las
+    KEYWORDS. Devuelve (coincide, motivo).
+
+    Si algo falla (descarga, PDF escaneado sin texto, etc.) se devuelve
+    (True, motivo) para NO descartar la oportunidad por un problema técnico:
+    en ese caso se notifica igual, basado en la coincidencia del título/
+    descripción, y se deja registrado en el log que no se pudo verificar.
+    """
+    try:
+        resp = session.get(url_pdf, timeout=25)
+        resp.raise_for_status()
+        texto = extraer_texto_pdf(resp.content)
+        if not texto.strip():
+            return True, "pdf_sin_texto_legible"
+        encontrada = pdf_contiene_palabra_clave(texto)
+        if encontrada:
+            return True, f"coincide_en_pdf:{encontrada}"
+        return False, "pdf_no_contiene_palabras_clave"
+    except Exception as e:
+        log.warning("No se pudo descargar/leer el PDF de requerimiento (%s): %s", url_pdf, e)
+        return True, "error_al_verificar_pdf"
+
+
+def search_keyword(
+    driver: webdriver.Chrome,
+    keyword: str,
+    http_session: requests.Session | None = None,
+) -> list[Contratacion]:
     """
     Busca una palabra clave en el buscador del SEACE (con los filtros
-    Objeto=Bien, Objeto=Servicio y Estado=Vigente siempre marcados) y devuelve los resultados
-    encontrados como tarjetas.
+    Objeto=Bien y Estado=Vigente siempre marcados) y devuelve
+    los resultados encontrados como tarjetas, verificados contra el PDF de
+    requerimiento cuando es posible.
     """
     wait = WebDriverWait(driver, 25)
 
@@ -481,6 +533,29 @@ def search_keyword(driver: webdriver.Chrome, keyword: str) -> list[Contratacion]
                 )
                 continue
 
+            # 🔒 FILTRO 3: revisar el PDF de "Descargar requerimiento" y
+            # confirmar que realmente trata sobre mochila/morral/maletín/
+            # bolsa de tela, no solo que la palabra aparezca de pasada en el
+            # título. Si no hay sesión HTTP o no se encuentra el enlace, se
+            # notifica igual (basado en el título) y se deja constancia en el log.
+            if http_session is not None:
+                url_pdf = find_requerimiento_link(tarjeta)
+                if url_pdf:
+                    coincide, motivo = verificar_requerimiento_pdf(http_session, url_pdf)
+                    if not coincide:
+                        log.info(
+                            "Descartado tras revisar el PDF de requerimiento (%s): %s",
+                            motivo, descripcion[:60],
+                        )
+                        continue
+                    else:
+                        log.debug("PDF verificado (%s): %s", motivo, descripcion[:60])
+                else:
+                    log.debug(
+                        "No se encontró enlace 'Descargar requerimiento'; se notifica solo por título: %s",
+                        descripcion[:60],
+                    )
+
             resultados.append(
                 Contratacion(
                     id=uid,
@@ -581,12 +656,14 @@ def run_once(headless: bool = True) -> None:
         except Exception:
             log.warning("La página tardó en cargar el buscador; se continúa de todos modos.")
         time.sleep(1)
-        ensure_filters(driver)  # confirma Objeto=Bien, Objeto=Servicio y Estado=Vigente antes de empezar
+        ensure_filters(driver)  # confirma Objeto=Bien y Estado=Vigente antes de empezar
+
+        http_session = build_http_session_from_driver(driver)
 
         for kw in KEYWORDS:
             log.info("Buscando: '%s'", kw)
             try:
-                resultados = search_keyword(driver, kw)
+                resultados = search_keyword(driver, kw, http_session=http_session)
             except Exception as e:
                 log.error("Error buscando '%s': %s", kw, e)
                 continue
