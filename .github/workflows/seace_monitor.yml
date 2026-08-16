@@ -1,5 +1,4 @@
 name: SEACE Monitor - Revisión diaria
-
 on:
   schedule:
     # Corre todos los días a las 08:05 hora Perú (13:05 UTC, Perú = UTC-5)
@@ -11,26 +10,29 @@ concurrency:
   group: seace-monitor
   cancel-in-progress: false
 
+# IMPORTANTE: sin esto, el GITHUB_TOKEN solo tiene permiso de LECTURA por
+# defecto y el "git push" del último paso falla en silencio (el job puede
+# incluso marcarse en rojo, pero si nadie lo revisa pasa desapercibido).
+# Sin este permiso, seen_items.json nunca se actualiza en el repo y por eso
+# llegan licitaciones repetidas cada día.
+permissions:
+  contents: write
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Descargar el repositorio
         uses: actions/checkout@v4
-
       - name: Instalar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Instalar Google Chrome
         uses: browser-actions/setup-chrome@v1
-
       - name: Instalar dependencias
         run: pip install -r requirements.txt
-
       - name: Ejecutar el monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -41,7 +43,6 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python seace_monitor.py
-
       # El runner de GitHub se borra por completo después de cada ejecución,
       # así que "seen_items.json" (el registro de lo ya avisado) se guardaría
       # en la nube sólo si lo devolvemos al repositorio. Este paso lo commitea
