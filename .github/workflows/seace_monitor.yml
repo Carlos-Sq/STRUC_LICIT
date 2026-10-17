@@ -1,8 +1,11 @@
-name: SEACE Monitor - Revisión diaria
+name: SEACE Monitor - Revisión 3 veces al día
 on:
   schedule:
-    # Corre todos los días a las 08:05 hora Perú (13:05 UTC, Perú = UTC-5)
-    - cron: "5 13 * * *"
+    # Perú = UTC-5 (sin horario de verano). GitHub puede demorar la ejecución
+    # unos minutos respecto a la hora indicada.
+    - cron: "0 18 * * *"   # 1:00 pm Perú
+    - cron: "0 22 * * *"   # 5:00 pm Perú
+    - cron: "0 2 * * *"    # 9:00 pm Perú
   workflow_dispatch: {}   # también te deja correrlo manualmente desde la pestaña "Actions"
 
 # Evita que corran dos revisiones al mismo tiempo si una se atrasa
