@@ -50,7 +50,7 @@ import smtplib
 import sys
 import time
 import unicodedata
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -175,9 +175,13 @@ class Contratacion:
     estado: str
     link: str
     keyword: str
+    # PDF del requerimiento (si se pudo ubicar/descargar). pdf_bytes no se
+    # imprime en logs ni se compara (repr/compare=False) para no ensuciarlos.
+    pdf_url: str = ""
+    pdf_bytes: bytes | None = field(default=None, repr=False, compare=False)
 
     def to_text(self) -> str:
-        return (
+        texto = (
             f"🎒 Nueva licitación relacionada a textil/mochilas\n\n"
             f"Código: {self.codigo}\n"
             f"Entidad: {self.entidad}\n"
@@ -188,6 +192,10 @@ class Contratacion:
             f"Palabra clave: {self.keyword}\n"
             f"Link: {self.link}"
         )
+        # Si no se pudo adjuntar el PDF, al menos se deja el enlace directo.
+        if self.pdf_url and not self.pdf_bytes:
+            texto += f"\nPDF requerimiento: {self.pdf_url}"
+        return texto
 
 
 # ---------------------------------------------------------------------------
@@ -349,29 +357,41 @@ def extraer_texto_pdf(pdf_bytes: bytes) -> str:
     return "\n".join(paginas_texto)
 
 
-def verificar_requerimiento_pdf(session: requests.Session, url_pdf: str) -> tuple[bool, str]:
+def verificar_requerimiento_pdf(
+    session: requests.Session, url_pdf: str
+) -> tuple[bool, str, bytes | None]:
     """
     Descarga el PDF del requerimiento y revisa si contiene alguna de las
-    KEYWORDS. Devuelve (coincide, motivo).
+    KEYWORDS. Devuelve (coincide, motivo, pdf_bytes).
+
+    pdf_bytes es el contenido descargado (para poder enviarlo por Telegram)
+    o None si no se pudo descargar.
 
     Si algo falla (descarga, PDF escaneado sin texto, etc.) se devuelve
-    (True, motivo) para NO descartar la oportunidad por un problema técnico:
+    (True, motivo, ...) para NO descartar la oportunidad por un problema técnico:
     en ese caso se notifica igual, basado en la coincidencia del título/
     descripción, y se deja registrado en el log que no se pudo verificar.
     """
     try:
         resp = session.get(url_pdf, timeout=25)
         resp.raise_for_status()
-        texto = extraer_texto_pdf(resp.content)
-        if not texto.strip():
-            return True, "pdf_sin_texto_legible"
-        encontrada = pdf_contiene_palabra_clave(texto)
-        if encontrada:
-            return True, f"coincide_en_pdf:{encontrada}"
-        return False, "pdf_no_contiene_palabras_clave"
+        pdf_bytes = resp.content
     except Exception as e:
-        log.warning("No se pudo descargar/leer el PDF de requerimiento (%s): %s", url_pdf, e)
-        return True, "error_al_verificar_pdf"
+        log.warning("No se pudo descargar el PDF de requerimiento (%s): %s", url_pdf, e)
+        return True, "error_al_verificar_pdf", None
+
+    try:
+        texto = extraer_texto_pdf(pdf_bytes)
+    except Exception as e:
+        log.warning("No se pudo leer el texto del PDF (%s): %s", url_pdf, e)
+        return True, "error_al_verificar_pdf", pdf_bytes
+
+    if not texto.strip():
+        return True, "pdf_sin_texto_legible", pdf_bytes
+    encontrada = pdf_contiene_palabra_clave(texto)
+    if encontrada:
+        return True, f"coincide_en_pdf:{encontrada}", pdf_bytes
+    return False, "pdf_no_contiene_palabras_clave", pdf_bytes
 
 
 def search_keyword(
@@ -538,10 +558,12 @@ def search_keyword(
             # bolsa de tela, no solo que la palabra aparezca de pasada en el
             # título. Si no hay sesión HTTP o no se encuentra el enlace, se
             # notifica igual (basado en el título) y se deja constancia en el log.
+            url_pdf = ""
+            pdf_bytes = None
             if http_session is not None:
-                url_pdf = find_requerimiento_link(tarjeta)
+                url_pdf = find_requerimiento_link(tarjeta) or ""
                 if url_pdf:
-                    coincide, motivo = verificar_requerimiento_pdf(http_session, url_pdf)
+                    coincide, motivo, pdf_bytes = verificar_requerimiento_pdf(http_session, url_pdf)
                     if not coincide:
                         log.info(
                             "Descartado tras revisar el PDF de requerimiento (%s): %s",
@@ -567,6 +589,8 @@ def search_keyword(
                     estado=estado,
                     link=link,
                     keyword=keyword,
+                    pdf_url=url_pdf,
+                    pdf_bytes=pdf_bytes,
                 )
             )
         except Exception as e:
@@ -616,6 +640,39 @@ def send_telegram(text: str) -> None:
             log.error("Excepción enviando Telegram a %s: %s", chat_id, e)
 
 
+TELEGRAM_MAX_FILE_BYTES = 49 * 1024 * 1024  # Telegram permite hasta 50 MB por archivo
+
+
+def send_telegram_document(pdf_bytes: bytes, filename: str, caption: str = "") -> None:
+    """Envía un PDF como documento adjunto a todos los chat_id configurados."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    if len(pdf_bytes) > TELEGRAM_MAX_FILE_BYTES:
+        log.warning("PDF demasiado grande para Telegram (%d bytes): %s", len(pdf_bytes), filename)
+        return
+
+    chat_ids = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(",") if cid.strip()]
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    for chat_id in chat_ids:
+        try:
+            resp = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": caption[:1000]},
+                files={"document": (filename, pdf_bytes, "application/pdf")},
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                log.error("Error enviando PDF por Telegram a %s: %s %s", chat_id, resp.status_code, resp.text)
+        except Exception as e:
+            log.error("Excepción enviando PDF por Telegram a %s: %s", chat_id, e)
+
+
+def _nombre_pdf(item: "Contratacion") -> str:
+    """Nombre de archivo seguro para el PDF (ej. requerimiento_CM-12-2026.pdf)."""
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", item.codigo).strip("_") or "requerimiento"
+    return f"requerimiento_{base}.pdf"
+
+
 def send_email(subject: str, body: str) -> None:
     if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
         log.warning("Correo no configurado (falta EMAIL_FROM/EMAIL_PASSWORD/EMAIL_TO en .env)")
@@ -636,6 +693,12 @@ def send_email(subject: str, body: str) -> None:
 def notify(item: Contratacion) -> None:
     texto = item.to_text()
     send_telegram(texto)
+    if item.pdf_bytes:
+        send_telegram_document(
+            item.pdf_bytes,
+            _nombre_pdf(item),
+            caption=f"📎 Requerimiento: {item.codigo}",
+        )
     send_email(subject=f"Nueva licitación: {item.keyword}", body=texto)
     log.info("Notificación enviada: %s | %s", item.entidad, item.descripcion[:60])
 
@@ -646,6 +709,8 @@ def notify(item: Contratacion) -> None:
 
 def run_once(headless: bool = True) -> None:
     log.info("Iniciando revisión del SEACE (%d palabras clave)...", len(KEYWORDS))
+    hora_inicio = datetime.now(PERU_TZ).strftime("%d/%m/%Y %I:%M %p")
+    send_telegram(f"🔎 Iniciando búsqueda en SEACE…\n🕒 {hora_inicio} (hora Perú)")
     seen = load_seen()
     nuevos_total = 0
 
@@ -681,11 +746,19 @@ def run_once(headless: bool = True) -> None:
                     notify(item)
 
             time.sleep(2)  # pausa breve entre búsquedas para no saturar el sitio
+    except Exception as e:
+        send_telegram(f"⚠️ La búsqueda en SEACE falló: {e}")
+        raise
     finally:
         driver.quit()
 
     save_seen(seen)
     log.info("Revisión terminada. Resultados nuevos notificados: %d", nuevos_total)
+    send_telegram(
+        f"✅ Búsqueda terminada. Licitaciones nuevas: {nuevos_total}"
+        if nuevos_total
+        else "✅ Búsqueda terminada. Sin licitaciones nuevas."
+    )
 
 
 def main():
